@@ -12,11 +12,20 @@ from loguru import logger
 
 import torch
 import torch.distributed as dist
-from voyager.constants import PROMPT_TEMPLATE, NEGATIVE_PROMPT, PRECISION_TO_TYPE, NEGATIVE_PROMPT_I2V
+from voyager.constants import (
+    PROMPT_TEMPLATE,
+    NEGATIVE_PROMPT,
+    PRECISION_TO_TYPE,
+    NEGATIVE_PROMPT_I2V,
+)
 from voyager.vae import load_vae
 from voyager.modules import load_model
 from voyager.text_encoder import TextEncoder
-from voyager.utils.data_utils import align_to, get_closest_ratio, generate_crop_size_list
+from voyager.utils.data_utils import (
+    align_to,
+    get_closest_ratio,
+    generate_crop_size_list,
+)
 from voyager.utils.lora_utils import load_lora_for_pipeline
 from voyager.utils.geometry import get_plucker_coordinates
 from voyager.utils.train_utils import load_state_dict
@@ -39,7 +48,7 @@ try:
         get_sequence_parallel_rank,
         get_sp_group,
         initialize_model_parallel,
-        init_distributed_environment
+        init_distributed_environment,
     )
 except:
     xfuser = None
@@ -54,7 +63,7 @@ def load_init_camera_params(camera_path, Height, Width):
     if not os.path.exists(camera_path):
         raise FileNotFoundError(f"Camera data not found: {camera_path}")
 
-    with open(camera_path, 'r') as f:
+    with open(camera_path, "r") as f:
         data = json.load(f)
 
     cameras = data.get("cameras_interp", [])
@@ -64,11 +73,7 @@ def load_init_camera_params(camera_path, Height, Width):
 
     cx = 0.5
     cy = 0.5
-    intrinsics = np.array([
-        [fx, 0, cx],
-        [0, fy, cy],
-        [0, 0, 1]
-    ])
+    intrinsics = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
     intrinsics = np.stack([intrinsics] * extrinsics.shape[0], axis=0)
 
     c2w = torch.from_numpy(np.linalg.inv(extrinsics)).float()
@@ -105,8 +110,15 @@ def load_init_camera_params(camera_path, Height, Width):
         extrinsics_src=w2c[0],
         extrinsics=w2c,
         intrinsics=intrinsics.float().clone(),
-        target_size=(Height//8, Width//8),
+        target_size=(Height // 8, Width // 8),
     )
+    """
+        什么是 Plucker 坐标? 6维向量表示 3D 空间中一条射线(ray)的数学方法
+        数学定义: Plucker Coord = [d, m]
+                - d: 射线的方向向量(3d)
+                - m：射线的矩向量(moment vector, 3D) 
+        Plucker 坐标同时编码 1. 每个像素对应的3D射线方向，2. 相机在3D空间的位置
+    """
     return plucker_coordinate
 
 
@@ -151,8 +163,8 @@ def get_1d_rotary_pos_embed_riflex(
         pos = torch.from_numpy(pos)  # type: ignore  # [S]
 
     freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, device=pos.device)
-                  [: (dim // 2)].float() / dim)
+        theta
+        ** (torch.arange(0, dim, 2, device=pos.device)[: (dim // 2)].float() / dim)
     )  # [D/2]
 
     # === Riflex modification start ===
@@ -160,7 +172,7 @@ def get_1d_rotary_pos_embed_riflex(
     # Empirical observations show that a few videos may exhibit repetition in the tail frames.
     # To be conservative, we multiply by 0.9 to keep the extrapolated length below 90% of a single period.
     if k is not None:
-        freqs[k-1] = 0.9 * 2 * torch.pi / L_test
+        freqs[k - 1] = 0.9 * 2 * torch.pi / L_test
     # === Riflex modification end ===
 
     freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
@@ -170,12 +182,14 @@ def get_1d_rotary_pos_embed_riflex(
         return freqs_cos, freqs_sin
     else:
         # lumina
-        freqs_cis = torch.polar(torch.ones_like(
-            freqs), freqs)  # complex64     # [S, D/2]
+        freqs_cis = torch.polar(
+            torch.ones_like(freqs), freqs
+        )  # complex64     # [S, D/2]
         return freqs_cis
 
 
 ###############################################
+
 
 def parallelize_transformer(pipe):
     transformer = pipe.transformer
@@ -206,36 +220,42 @@ def parallelize_transformer(pipe):
             split_dim = -1
         else:
             raise ValueError(
-            f"Cannot split video sequence into ulysses_degree x ring_degree \
-            ({get_sequence_parallel_world_size()}) parts evenly")
+                f"Cannot split video sequence into ulysses_degree x ring_degree \
+            ({get_sequence_parallel_world_size()}) parts evenly"
+            )
 
         # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
         temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
         h_cond = h // 2
 
         x = torch.chunk(x, get_sequence_parallel_world_size(), dim=split_dim)[
-            get_sequence_parallel_rank()]
+            get_sequence_parallel_rank()
+        ]
 
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
-        freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(
-        ), dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_cos = torch.chunk(
+            freqs_cos, get_sequence_parallel_world_size(), dim=split_dim - 1
+        )[get_sequence_parallel_rank()]
         freqs_cos = freqs_cos.reshape(-1, dim_thw)
         dim_thw = freqs_sin.shape[-1]
         freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
-        freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(
-        ), dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_sin = torch.chunk(
+            freqs_sin, get_sequence_parallel_world_size(), dim=split_dim - 1
+        )[get_sequence_parallel_rank()]
         freqs_sin = freqs_sin.reshape(-1, dim_thw)
 
         dim_thw_cond = freqs_cos_cond.shape[-1]
         freqs_cos_cond = freqs_cos_cond.reshape(temporal_size, h_cond, w, dim_thw_cond)
-        freqs_cos_cond = torch.chunk(freqs_cos_cond, get_sequence_parallel_world_size(
-        ), dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_cos_cond = torch.chunk(
+            freqs_cos_cond, get_sequence_parallel_world_size(), dim=split_dim - 1
+        )[get_sequence_parallel_rank()]
         freqs_cos_cond = freqs_cos_cond.reshape(-1, dim_thw_cond)
         dim_thw_cond = freqs_sin_cond.shape[-1]
         freqs_sin_cond = freqs_sin_cond.reshape(temporal_size, h_cond, w, dim_thw_cond)
-        freqs_sin_cond = torch.chunk(freqs_sin_cond, get_sequence_parallel_world_size(
-        ), dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_sin_cond = torch.chunk(
+            freqs_sin_cond, get_sequence_parallel_world_size(), dim=split_dim - 1
+        )[get_sequence_parallel_rank()]
         freqs_sin_cond = freqs_sin_cond.reshape(-1, dim_thw_cond)
 
         from xfuser.core.long_ctx_attention import xFuserLongContextAttention
@@ -286,7 +306,7 @@ def load_models(args, device, logger, pretrained_model_path):
         out_channels=out_channels,
         factor_kwargs=factor_kwargs,
     )
-    
+
     model = model.to(device)
     model = load_state_dict(args, model, logger, pretrained_model_path)
     model.eval()
@@ -308,18 +328,23 @@ def load_models(args, device, logger, pretrained_model_path):
         args.prompt_template_video = "dit-llm-encode-video-i2v"
 
     if args.prompt_template_video is not None:
-        crop_start = PROMPT_TEMPLATE[args.prompt_template_video].get(
-            "crop_start", 0)
+        crop_start = PROMPT_TEMPLATE[args.prompt_template_video].get("crop_start", 0)
     elif args.prompt_template is not None:
-        crop_start = PROMPT_TEMPLATE[args.prompt_template].get(
-            "crop_start", 0)
+        crop_start = PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
     else:
         crop_start = 0
     max_length = args.text_len + crop_start
 
-    prompt_template = PROMPT_TEMPLATE[args.prompt_template] if args.prompt_template is not None else None
-    prompt_template_video = PROMPT_TEMPLATE[
-        args.prompt_template_video] if args.prompt_template_video is not None else None
+    prompt_template = (
+        PROMPT_TEMPLATE[args.prompt_template]
+        if args.prompt_template is not None
+        else None
+    )
+    prompt_template_video = (
+        PROMPT_TEMPLATE[args.prompt_template_video]
+        if args.prompt_template_video is not None
+        else None
+    )
 
     # Text encoder
     text_encoder = TextEncoder(
@@ -335,7 +360,7 @@ def load_models(args, device, logger, pretrained_model_path):
         reproduce=args.reproduce,
         logger=logger,
         device=device if not args.use_cpu_offload else "cpu",
-        image_embed_interleave=image_embed_interleave
+        image_embed_interleave=image_embed_interleave,
     ).to(device)
 
     text_encoder_2 = None
@@ -379,9 +404,7 @@ class Inference(object):
         self.device = (
             device
             if device is not None
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
+            else "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.logger = logger
         self.parallel_args = parallel_args
@@ -399,18 +422,21 @@ class Inference(object):
             args (argparse.Namespace): The arguments for the pipeline.
             device (int): The device for inference. Default is None.
         """
-        logger.info(
-            f"Got text-to-video model root path: {pretrained_model_path}")
+        logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
 
         # ========================================================================
         # Initialize Distributed Environment
         # ========================================================================
         # 20250316 pftq: Modified to extract rank and world_size early for sequential loading
         if args.ulysses_degree > 1 or args.ring_degree > 1:
-            assert xfuser is not None, "Ulysses Attention and Ring Attention requires xfuser package."
-            assert args.use_cpu_offload is False, "Cannot enable use_cpu_offload in the distributed environment."
+            assert (
+                xfuser is not None
+            ), "Ulysses Attention and Ring Attention requires xfuser package."
+            assert (
+                args.use_cpu_offload is False
+            ), "Cannot enable use_cpu_offload in the distributed environment."
             # 20250316 pftq: Set local rank and device explicitly for NCCL
-            local_rank = int(os.environ['LOCAL_RANK'])
+            local_rank = int(os.environ["LOCAL_RANK"])
             device = torch.device(f"cuda:{local_rank}")
             # 20250316 pftq: Set CUDA device explicitly
             torch.cuda.set_device(local_rank)
@@ -418,8 +444,9 @@ class Inference(object):
             dist.init_process_group("nccl")
             rank = dist.get_rank()
             world_size = dist.get_world_size()
-            assert world_size == args.ring_degree * args.ulysses_degree, \
-                "number of GPUs should be equal to ring_degree * ulysses_degree."
+            assert (
+                world_size == args.ring_degree * args.ulysses_degree
+            ), "number of GPUs should be equal to ring_degree * ulysses_degree."
             init_distributed_environment(rank=rank, world_size=world_size)
             initialize_model_parallel(
                 sequence_parallel_degree=world_size,
@@ -432,8 +459,10 @@ class Inference(object):
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        parallel_args = {"ulysses_degree": args.ulysses_degree,
-                         "ring_degree": args.ring_degree}
+        parallel_args = {
+            "ulysses_degree": args.ulysses_degree,
+            "ring_degree": args.ring_degree,
+        }
         torch.set_grad_enabled(False)
 
         # ========================================================================
@@ -442,8 +471,9 @@ class Inference(object):
         # 20250316 pftq: Load models only on rank 0, then broadcast
         if rank == 0:
             logger.info("Building model...")
-            model, vae, text_encoder, text_encoder_2, vae_kwargs = \
-                load_models(args, device, logger, pretrained_model_path)
+            model, vae, text_encoder, text_encoder_2, vae_kwargs = load_models(
+                args, device, logger, pretrained_model_path
+            )
         else:
             # 20250316 pftq: Initialize as None on non-zero ranks
             model = None
@@ -458,8 +488,9 @@ class Inference(object):
             dist.barrier()  # Ensure rank 0 finishes loading before broadcasting
             if rank != 0:
                 # Reconstruct model skeleton on non-zero ranks
-                model, vae, text_encoder, text_encoder_2, vae_kwargs = \
-                    load_models(args, device, logger, pretrained_model_path)
+                model, vae, text_encoder, text_encoder_2, vae_kwargs = load_models(
+                    args, device, logger, pretrained_model_path
+                )
 
             # Broadcast model parameters with logging
             logger.info(f"Rank {rank}: Broadcasting model parameters")
@@ -478,8 +509,7 @@ class Inference(object):
             for param in text_encoder.parameters():
                 dist.broadcast(param.data, src=0)
             if text_encoder_2 is not None:
-                logger.info(
-                    f"Rank {rank}: Broadcasting text_encoder_2 parameters")
+                logger.info(f"Rank {rank}: Broadcasting text_encoder_2 parameters")
                 for param in text_encoder_2.parameters():
                     dist.broadcast(param.data, src=0)
 
@@ -493,7 +523,7 @@ class Inference(object):
             use_cpu_offload=args.use_cpu_offload,
             device=device,
             logger=logger,
-            parallel_args=parallel_args
+            parallel_args=parallel_args,
         )
 
     @staticmethod
@@ -501,13 +531,11 @@ class Inference(object):
         if isinstance(size, int):
             size = [size]
         if not isinstance(size, (list, tuple)):
-            raise ValueError(
-                f"Size must be an integer or (height, width), got {size}.")
+            raise ValueError(f"Size must be an integer or (height, width), got {size}.")
         if len(size) == 1:
             size = [size[0], size[0]]
         if len(size) != 2:
-            raise ValueError(
-                f"Size must be an integer or (height, width), got {size}.")
+            raise ValueError(f"Size must be an integer or (height, width), got {size}.")
         return size
 
 
@@ -524,7 +552,7 @@ class HunyuanVideoSampler(Inference):
         use_cpu_offload=False,
         device=0,
         logger=None,
-        parallel_args=None
+        parallel_args=None,
     ):
         super().__init__(
             args,
@@ -537,7 +565,7 @@ class HunyuanVideoSampler(Inference):
             use_cpu_offload=use_cpu_offload,
             device=device,
             logger=logger,
-            parallel_args=parallel_args
+            parallel_args=parallel_args,
         )
 
         self.pipeline = self.load_diffusion_pipeline(
@@ -553,15 +581,26 @@ class HunyuanVideoSampler(Inference):
             self.default_negative_prompt = NEGATIVE_PROMPT_I2V
             if args.use_lora:
                 self.pipeline = load_lora_for_pipeline(
-                    self.pipeline, args.lora_path, LORA_PREFIX_TRANSFORMER="Hunyuan_video_I2V_lora",
-                    alpha=args.lora_scale, device=self.device,
-                    is_parallel=(self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1))
+                    self.pipeline,
+                    args.lora_path,
+                    LORA_PREFIX_TRANSFORMER="Hunyuan_video_I2V_lora",
+                    alpha=args.lora_scale,
+                    device=self.device,
+                    is_parallel=(
+                        self.parallel_args["ulysses_degree"] > 1
+                        or self.parallel_args["ring_degree"] > 1
+                    ),
+                )
                 logger.info(
-                f"load lora {args.lora_path} into pipeline, lora scale is {args.lora_scale}.")
+                    f"load lora {args.lora_path} into pipeline, lora scale is {args.lora_scale}."
+                )
         else:
             self.default_negative_prompt = NEGATIVE_PROMPT
 
-        if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
+        if (
+            self.parallel_args["ulysses_degree"] > 1
+            or self.parallel_args["ring_degree"] > 1
+        ):
             parallelize_transformer(self.pipeline)
 
     def load_diffusion_pipeline(
@@ -608,11 +647,9 @@ class HunyuanVideoSampler(Inference):
 
         # Compute latent sizes based on VAE type
         if "884" in self.args.vae:
-            latents_size = [(video_length - 1) // 4 +
-                            1, height // 8, width // 8]
+            latents_size = [(video_length - 1) // 4 + 1, height // 8, width // 8]
         elif "888" in self.args.vae:
-            latents_size = [(video_length - 1) // 8 +
-                            1, height // 8, width // 8]
+            latents_size = [(video_length - 1) // 8 + 1, height // 8, width // 8]
         else:
             latents_size = [video_length, height // 8, width // 8]
 
@@ -631,12 +668,14 @@ class HunyuanVideoSampler(Inference):
                 f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.model.patch_size}), "
                 f"but got {latents_size}."
             )
-            rope_sizes = [s // self.model.patch_size[idx]
-                          for idx, s in enumerate(latents_size)]
+            rope_sizes = [
+                s // self.model.patch_size[idx] for idx, s in enumerate(latents_size)
+            ]
 
         if len(rope_sizes) != target_ndim:
-            rope_sizes = [1] * (target_ndim - len(rope_sizes)
-                                ) + rope_sizes  # Pad time axis
+            rope_sizes = [1] * (
+                target_ndim - len(rope_sizes)
+            ) + rope_sizes  # Pad time axis
 
         # 20250316 pftq: Add RIFLEx logic for > 192 frames
         L_test = rope_sizes[0]  # Latent frames
@@ -645,18 +684,22 @@ class HunyuanVideoSampler(Inference):
 
         head_dim = self.model.hidden_size // self.model.heads_num
         rope_dim_list = self.model.rope_dim_list or [
-            head_dim // target_ndim for _ in range(target_ndim)]
-        assert sum(
-            rope_dim_list) == head_dim, "sum(rope_dim_list) must equal head_dim"
+            head_dim // target_ndim for _ in range(target_ndim)
+        ]
+        assert sum(rope_dim_list) == head_dim, "sum(rope_dim_list) must equal head_dim"
 
         if actual_num_frames > 192:
-            k = 2+((actual_num_frames + 3) // (4 * L_train))
+            k = 2 + ((actual_num_frames + 3) // (4 * L_train))
             k = max(4, min(8, k))
-            logger.debug(f"actual_num_frames = {actual_num_frames} > 192, RIFLEx applied with k = {k}")
+            logger.debug(
+                f"actual_num_frames = {actual_num_frames} > 192, RIFLEx applied with k = {k}"
+            )
 
             # Compute positional grids for RIFLEx
-            axes_grids = [torch.arange(
-                size, device=self.device, dtype=torch.float32) for size in rope_sizes]
+            axes_grids = [
+                torch.arange(size, device=self.device, dtype=torch.float32)
+                for size in rope_sizes
+            ]
             grid = torch.meshgrid(*axes_grids, indexing="ij")
             grid = torch.stack(grid, dim=0)  # [3, t, h, w]
             pos = grid.reshape(3, -1).t()  # [t * h * w, 3]
@@ -671,7 +714,7 @@ class HunyuanVideoSampler(Inference):
                         theta=self.args.rope_theta,
                         use_real=True,
                         k=k,
-                        L_test=L_test
+                        L_test=L_test,
                     )
                 else:  # Spatial with default RoPE
                     freqs_cos, freqs_sin = get_1d_rotary_pos_embed_riflex(
@@ -680,17 +723,23 @@ class HunyuanVideoSampler(Inference):
                         theta=self.args.rope_theta,
                         use_real=True,
                         k=None,
-                        L_test=None
+                        L_test=None,
                     )
                 freqs.append((freqs_cos, freqs_sin))
-                logger.debug(f"freq[{i}] shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+                logger.debug(
+                    f"freq[{i}] shape: {freqs_cos.shape}, device: {freqs_cos.device}"
+                )
 
             freqs_cos = torch.cat([f[0] for f in freqs], dim=1)
             freqs_sin = torch.cat([f[1] for f in freqs], dim=1)
-            logger.debug(f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+            logger.debug(
+                f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}"
+            )
         else:
             # 20250316 pftq: Original code for <= 192 frames
-            logger.debug(f"actual_num_frames = {actual_num_frames} <= 192, using original RoPE")
+            logger.debug(
+                f"actual_num_frames = {actual_num_frames} <= 192, using original RoPE"
+            )
             freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
                 rope_dim_list,
                 rope_sizes,
@@ -698,35 +747,47 @@ class HunyuanVideoSampler(Inference):
                 use_real=True,
                 theta_rescale_factor=1,
             )
-            logger.debug(f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+            logger.debug(
+                f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}"
+            )
 
         return freqs_cos, freqs_sin
 
     def process(self, pil_img):
-        if pil_img.mode == 'L':
-            pil_img = pil_img.convert('RGB')
-        image = np.asarray(pil_img, dtype=np.float32) / 255.
+        if pil_img.mode == "L":
+            pil_img = pil_img.convert("RGB")
+        image = np.asarray(pil_img, dtype=np.float32) / 255.0
         image = image[:, :, :3]
         image = torch.from_numpy(image).permute(2, 0, 1).contiguous().float()
-        image = T.Normalize(mean=[0.5, 0.5, 0.5], std=[
-                            0.5, 0.5, 0.5], inplace=True)(image)
+        image = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)(
+            image
+        )
         return image
 
     def load_image(self, path, image_size=(512, 512)):
         if isinstance(path, tuple):
             ref_rgb = self.load_image(path[0], image_size)
             ref_depth = self.load_image(path[1], image_size)
-            return torch.cat([ref_rgb, torch.ones_like(ref_rgb)[..., :16, :], ref_depth], dim=1)
+            return torch.cat(
+                [ref_rgb, torch.ones_like(ref_rgb)[..., :16, :], ref_depth], dim=1
+            )
 
-        if path.endswith('.exr'):
-            depth = torch.from_numpy(cv2.resize(pyexr.read(path).squeeze(
-            ), (image_size[1], image_size[0]), interpolation=cv2.INTER_LINEAR)).float()
+        if path.endswith(".exr"):
+            depth = torch.from_numpy(
+                cv2.resize(
+                    pyexr.read(path).squeeze(),
+                    (image_size[1], image_size[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            ).float()
             image = depth.unsqueeze(0).repeat(3, 1, 1)
-            image = T.Normalize(mean=[0.5, 0.5, 0.5], std=[
-                                0.5, 0.5, 0.5], inplace=True)(image)
+            image = T.Normalize(
+                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
+            )(image)
         else:
-            pil_img = Image.open(path) if isinstance(
-                path, str) else Image.fromarray(path)
+            pil_img = (
+                Image.open(path) if isinstance(path, str) else Image.fromarray(path)
+            )
             pil_img = pil_img.resize((image_size[1], image_size[0]))
             image = self.process(pil_img)
 
@@ -792,8 +853,7 @@ class HunyuanVideoSampler(Inference):
             raise ValueError(
                 f"Seed must be an integer, a list of integers, or None, got {seed}."
             )
-        generator = [torch.Generator(
-            self.device).manual_seed(seed) for seed in seeds]
+        generator = [torch.Generator(self.device).manual_seed(seed) for seed in seeds]
         out_dict["seeds"] = seeds
 
         if width <= 0 or height <= 0 or video_length <= 0:
@@ -818,8 +878,7 @@ class HunyuanVideoSampler(Inference):
         out_dict["size"] = (target_height, target_width, target_video_length)
 
         if not isinstance(prompt, str):
-            raise TypeError(
-                f"`prompt` must be a string, but got {type(prompt)}")
+            raise TypeError(f"`prompt` must be a string, but got {type(prompt)}")
         prompt = [prompt.strip()]
 
         if negative_prompt is None or negative_prompt == "":
@@ -835,39 +894,60 @@ class HunyuanVideoSampler(Inference):
         scheduler = FlowMatchDiscreteScheduler(
             shift=flow_shift,
             reverse=self.args.flow_reverse,
-            solver=self.args.flow_solver
+            solver=self.args.flow_solver,
         )
         self.pipeline.scheduler = scheduler
 
         # Set the target image size for processing reference images and partial conditions
         # This size should match the model's expected input dimensions
         closest_size = (height, width)
-        
+
         # Load and preprocess reference images for the video generation
         # Convert image paths to pixel values and stack them into a batch
-        ref_images_pixel_values = [self.load_image(
-            image_path, image_size=closest_size) for image_path in ref_images]
-        ref_images_pixel_values = torch.cat(
-            ref_images_pixel_values).unsqueeze(0).unsqueeze(2).to(self.device)
-        
+        ref_images_pixel_values = [
+            self.load_image(image_path, image_size=closest_size)
+            for image_path in ref_images
+        ]
+        ref_images_pixel_values = (
+            torch.cat(ref_images_pixel_values).unsqueeze(0).unsqueeze(2).to(self.device)
+        )
+
         # Convert pixel values back to PIL Image format for visualization/debugging
         # Normalize from [-1, 1] range to [0, 255] range and save as PNG
-        ref_images = [Image.fromarray(((torch.clamp(ref_images_pixel_values[0, :, 0].permute(
-            1, 2, 0), min=-1, max=1).cpu().numpy() + 1) * 0.5 * 255).astype(np.uint8))]
+        ref_images = [
+            Image.fromarray(
+                (
+                    (
+                        torch.clamp(
+                            ref_images_pixel_values[0, :, 0].permute(1, 2, 0),
+                            min=-1,
+                            max=1,
+                        )
+                        .cpu()
+                        .numpy()
+                        + 1
+                    )
+                    * 0.5
+                    * 255
+                ).astype(np.uint8)
+            )
+        ]
 
         # Load partial condition images (frames that will guide the video generation)
         # These images provide temporal guidance for the video sequence
-        partial_cond = [self.load_image(
-            image_path, image_size=closest_size) for image_path in partial_cond]
-        partial_cond = torch.stack(
-            partial_cond, dim=1).unsqueeze(0).to(self.device)
-        
+        partial_cond = [
+            self.load_image(image_path, image_size=closest_size)
+            for image_path in partial_cond
+        ]
+        partial_cond = torch.stack(partial_cond, dim=1).unsqueeze(0).to(self.device)
+
         # Load partial mask images (indicate which regions should be preserved/modified)
         # Masks control which parts of the video should be generated vs. kept from conditions
-        partial_mask = [self.load_image(
-            image_path, image_size=closest_size) for image_path in partial_mask]
-        partial_mask = torch.stack(
-            partial_mask, dim=1).unsqueeze(0).to(self.device)
+        partial_mask = [
+            self.load_image(image_path, image_size=closest_size)
+            for image_path in partial_mask
+        ]
+        partial_mask = torch.stack(partial_mask, dim=1).unsqueeze(0).to(self.device)
 
         # Use automatic mixed precision for memory efficiency during encoding
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
@@ -877,33 +957,34 @@ class HunyuanVideoSampler(Inference):
             # Encode reference images to latent space representation
             # This creates a compressed representation that guides the video generation
             ref_latents = self.pipeline.vae.encode(
-                ref_images_pixel_values).latent_dist.sample()  # B, C, F, H, W
+                ref_images_pixel_values
+            ).latent_dist.sample()  # B, C, F, H, W
             ref_latents.mul_(self.pipeline.vae.config.scaling_factor)
 
             # Encode partial condition images to latent space
             # These latents provide temporal guidance for the video sequence
-            partial_cond = self.pipeline.vae.encode(
-                partial_cond).latent_dist.sample()
+            partial_cond = self.pipeline.vae.encode(partial_cond).latent_dist.sample()
             partial_cond.mul_(self.pipeline.vae.config.scaling_factor)
 
             # Process mask frames for controlling video generation
             # Invert the mask so that 1 indicates regions to be generated
             mask_frames = 1 - partial_mask
             first_mask = mask_frames[:, :, 0:1]  # Extract the first mask frame
-            
+
             # Prepend 3 copies of the first mask to create temporal consistency
             # This ensures the initial frames have consistent masking
             mask_frames = torch.cat(
-                [first_mask, first_mask, first_mask, mask_frames], dim=2)
-            
+                [first_mask, first_mask, first_mask, mask_frames], dim=2
+            )
+
             # Apply 3D max pooling to downsample masks to match latent space dimensions
             # Reduces temporal dimension by 4, spatial dimensions by 8
             mask_frames = torch.nn.functional.max_pool3d(
                 mask_frames,  # Input: [1, C, F, H, W]
                 kernel_size=(4, 8, 8),  # Reduce F by 4, H and W by 8
-                stride=(4, 8, 8)
+                stride=(4, 8, 8),
             )  # Output: [C, F//4, H//8, W//8]
-            
+
             # Invert the mask again so that 1 indicates regions to preserve
             mask_frames = 1 - mask_frames
             partial_mask = mask_frames[:, 0:1]
@@ -913,13 +994,13 @@ class HunyuanVideoSampler(Inference):
             # plucker_features = load_init_camera_params(
             #     camera_path, closest_size[0], closest_size[1])
             # plucker_features = plucker_features.transpose(0, 1).to(self.device)
-            
+
             # # Extract the first camera parameter and repeat it 3 times
             # # This ensures consistent camera parameters for the initial frames
             # first_plucker_feature = plucker_features[:, 0:1]
             # plucker_features = torch.cat(
             #     [first_plucker_feature, first_plucker_feature, first_plucker_feature, plucker_features], dim=1)
-            
+
             # # Apply 3D average pooling to downsample camera parameters
             # # Reduces temporal dimension by 4 while preserving spatial information
             # plucker_features = torch.nn.functional.avg_pool3d(
@@ -927,7 +1008,7 @@ class HunyuanVideoSampler(Inference):
             #     kernel_size=(4, 1, 1),
             #     stride=(4, 1, 1)
             # )
-            
+
             # # Pad camera parameters with ones to match expected dimensions
             # # This ensures the feature tensor has the correct shape for processing
             # plucker_features = torch.cat([plucker_features,
@@ -939,13 +1020,13 @@ class HunyuanVideoSampler(Inference):
         freqs_cos, freqs_sin = self.get_rotary_pos_embed(
             target_video_length, target_height, target_width
         )
-        
+
         # Generate rotary position embeddings for conditional frames
         # Adjusted dimensions account for the conditional frame structure
         freqs_cos_cond, freqs_sin_cond = self.get_rotary_pos_embed(
             target_video_length, (target_height - 16) // 2, target_width
         )
-        
+
         # Calculate the total number of tokens for the transformer model
         # This determines the sequence length for attention mechanisms
         n_tokens = freqs_cos.shape[0]
@@ -996,7 +1077,7 @@ class HunyuanVideoSampler(Inference):
             img_latents=ref_latents,
             semantic_images=ref_images,
             partial_cond=partial_cond,
-            partial_mask=partial_mask
+            partial_mask=partial_mask,
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt

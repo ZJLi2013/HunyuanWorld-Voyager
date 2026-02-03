@@ -67,8 +67,7 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
     # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
     noise_cfg = (
-        guidance_rescale * noise_pred_rescaled +
-        (1 - guidance_rescale) * noise_cfg
+        guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
     )
     return noise_cfg
 
@@ -166,8 +165,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
     model_cpu_offload_seq = "text_encoder->text_encoder_2->transformer->vae"
     _optional_components = ["text_encoder_2"]
     _exclude_from_cpu_offload = ["transformer"]
-    _callback_tensor_inputs = ["latents",
-                               "prompt_embeds", "negative_prompt_embeds"]
+    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
 
     def __init__(
         self,
@@ -235,10 +233,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             scheduler=scheduler,
             text_encoder_2=text_encoder_2,
         )
-        self.vae_scale_factor = 2 ** (
-            len(self.vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(
-            vae_scale_factor=self.vae_scale_factor)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
     def encode_prompt(
         self,
@@ -255,7 +251,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         clip_skip: Optional[int] = None,
         text_encoder: Optional[TextEncoder] = None,
         data_type: Optional[str] = "image",
-        semantic_images=None
+        semantic_images=None,
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
@@ -314,14 +310,20 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         if prompt_embeds is None:
             # textual inversion: process multi-vector tokens if necessary
             if isinstance(self, TextualInversionLoaderMixin):
-                prompt = self.maybe_convert_prompt(
-                    prompt, text_encoder.tokenizer)
+                prompt = self.maybe_convert_prompt(prompt, text_encoder.tokenizer)
 
+            # 1. positive prompt 编码
             text_inputs = text_encoder.text2tokens(prompt, data_type=data_type)
-
+            """
+                * clip_skip 跳过最后几层，使用中间层特征
+                * semantic_images，融合图像语义信息(TODO)
+            """
             if clip_skip is None:
                 prompt_outputs = text_encoder.encode(
-                    text_inputs, data_type=data_type, semantic_images=semantic_images, device=device
+                    text_inputs,
+                    data_type=data_type,
+                    semantic_images=semantic_images,
+                    device=device,
                 )
                 prompt_embeds = prompt_outputs.hidden_state
             else:
@@ -335,8 +337,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 # Access the `hidden_states` first, that contains a tuple of
                 # all the hidden states from the encoder layers. Then index into
                 # the tuple to access the hidden states from the desired layer.
-                prompt_embeds = prompt_outputs.hidden_states_list[-(
-                    clip_skip + 1)]
+                prompt_embeds = prompt_outputs.hidden_states_list[-(clip_skip + 1)]
                 # We also need to apply the final LayerNorm here to not mess with the
                 # representations. The `last_hidden_states` that we typically use for
                 # obtaining the final prompt representations passes through the LayerNorm
@@ -349,8 +350,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
                 bs_embed, seq_len = attention_mask.shape
-                attention_mask = attention_mask.repeat(
-                    1, num_videos_per_prompt)
+                attention_mask = attention_mask.repeat(1, num_videos_per_prompt)
                 attention_mask = attention_mask.view(
                     bs_embed * num_videos_per_prompt, seq_len
                 )
@@ -362,15 +362,14 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             prompt_embeds_dtype = prompt_embeds.dtype
 
-        prompt_embeds = prompt_embeds.to(
-            dtype=prompt_embeds_dtype, device=device)
+        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
 
+        # 2. 重复 embeddings (多视频生成)
         if prompt_embeds.ndim == 2:
             bs_embed, _ = prompt_embeds.shape
             # duplicate text embeddings for each generation per prompt, using mps friendly method
             prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt)
-            prompt_embeds = prompt_embeds.view(
-                bs_embed * num_videos_per_prompt, -1)
+            prompt_embeds = prompt_embeds.view(bs_embed * num_videos_per_prompt, -1)
         else:
             bs_embed, seq_len, _ = prompt_embeds.shape
             # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -379,7 +378,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 bs_embed * num_videos_per_prompt, seq_len, -1
             )
 
-        # get unconditional embeddings for classifier free guidance
+        # 3. Negative Prompt 编码(Classifier_Free_Guidance)
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             uncond_tokens: List[str]
             if negative_prompt is None:
@@ -407,17 +406,20 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 )
 
             # max_length = prompt_embeds.shape[1]
-            uncond_input = text_encoder.text2tokens(
-                uncond_tokens, data_type=data_type)
+            uncond_input = text_encoder.text2tokens(uncond_tokens, data_type=data_type)
 
             if semantic_images is not None:
-                uncond_image = [black_image(img.size[0], img.size[1])
-                                for img in semantic_images]
+                uncond_image = [
+                    black_image(img.size[0], img.size[1]) for img in semantic_images
+                ]
             else:
                 uncond_image = None
 
             negative_prompt_outputs = text_encoder.encode(
-                uncond_input, data_type=data_type, semantic_images=uncond_image, device=device
+                uncond_input,
+                data_type=data_type,
+                semantic_images=uncond_image,
+                device=device,
             )
             negative_prompt_embeds = negative_prompt_outputs.hidden_state
 
@@ -470,8 +472,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
     def decode_latents(self, latents, enable_tiling=True):
         deprecation_message = "The decode_latents method is deprecated and will be removed in 1.0.0.\
 Please use VaeImageProcessor.postprocess(...) instead"
-        deprecate("decode_latents", "1.0.0",
-                  deprecation_message, standard_warn=False)
+        deprecate("decode_latents", "1.0.0", deprecation_message, standard_warn=False)
 
         latents = 1 / self.vae.config.scaling_factor * latents
         if enable_tiling:
@@ -612,8 +613,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
         if i2v_mode and i2v_stability:
             if img_latents.shape[2] == 1:
                 img_latents = img_latents.repeat(1, 1, video_length, 1, 1)
-            x0 = randn_tensor(shape, generator=generator,
-                              device=device, dtype=dtype)
+            x0 = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             x1 = img_latents
 
             t = torch.tensor([0.999]).to(device=device)
@@ -716,8 +716,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_videos_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
-        generator: Optional[Union[torch.Generator,
-                                  List[torch.Generator]]] = None,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -888,8 +887,11 @@ Please use VaeImageProcessor.postprocess(...) instead"
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(
-            f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        device = (
+            torch.device(f"cuda:{dist.get_rank()}")
+            if dist.is_initialized()
+            else self._execution_device
+        )
 
         # 3. Encode input prompt
         lora_scale = (
@@ -916,7 +918,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
             lora_scale=lora_scale,
             clip_skip=self.clip_skip,
             data_type=data_type,
-            semantic_images=semantic_images
+            semantic_images=semantic_images,
         )
         if self.text_encoder_2 is not None:
             (
@@ -953,11 +955,9 @@ Please use VaeImageProcessor.postprocess(...) instead"
             if prompt_mask is not None:
                 prompt_mask = torch.cat([negative_prompt_mask, prompt_mask])
             if prompt_embeds_2 is not None:
-                prompt_embeds_2 = torch.cat(
-                    [negative_prompt_embeds_2, prompt_embeds_2])
+                prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2])
             if prompt_mask_2 is not None:
-                prompt_mask_2 = torch.cat(
-                    [negative_prompt_mask_2, prompt_mask_2])
+                prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
         # 4. Prepare timesteps
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
@@ -994,13 +994,12 @@ Please use VaeImageProcessor.postprocess(...) instead"
             img_latents=img_latents,
             i2v_mode=i2v_mode,
             i2v_condition_type=i2v_condition_type,
-            i2v_stability=i2v_stability
+            i2v_stability=i2v_stability,
         )
 
         if i2v_mode and i2v_condition_type == "latent_concat":
             if img_latents.shape[2] == 1:
-                img_latents_concat = img_latents.repeat(
-                    1, 1, video_length, 1, 1)
+                img_latents_concat = img_latents.repeat(1, 1, video_length, 1, 1)
             else:
                 img_latents_concat = img_latents
             img_latents_concat[:, :, 1:, ...] = 0
@@ -1008,9 +1007,13 @@ Please use VaeImageProcessor.postprocess(...) instead"
             i2v_mask = torch.zeros(video_length)
             i2v_mask[0] = 1
 
-            mask_concat = torch.ones(img_latents_concat.shape[0], 1,
-                                     img_latents_concat.shape[2], img_latents_concat.shape[3],
-                                     img_latents_concat.shape[4]).to(device=img_latents.device)
+            mask_concat = torch.ones(
+                img_latents_concat.shape[0],
+                1,
+                img_latents_concat.shape[2],
+                img_latents_concat.shape[3],
+                img_latents_concat.shape[4],
+            ).to(device=img_latents.device)
             mask_concat[:, :, 1:, ...] = 0
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -1029,8 +1032,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
         ) and not self.args.disable_autocast
 
         # 7. Denoising loop
-        num_warmup_steps = len(timesteps) - \
-            num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
         # if is_progress_bar:
@@ -1039,15 +1041,34 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 if self.interrupt:
                     continue
 
+                """
+                    token_replace: 沿着时间维度(dim=2) 拼接，第一帧直接用参考图像的img_latents；后续帧用随机噪声生成
+                """
                 if i2v_mode and i2v_condition_type == "token_replace":
                     latents = torch.concat(
-                        [img_latents, latents[:, :, 1:, :, :]], dim=2)
+                        [img_latents, latents[:, :, 1:, :, :]], dim=2
+                    )
 
-                # expand the latents if we are doing classifier free guidance
+                """
+                    latent_concat 
+                        * 沿着通道维度(dim=1) 拼接多种条件
+                        * 所有信息作为额外通道输入给模型
+                """  # expand the latents if we are doing classifier free guidance
                 if i2v_mode and i2v_condition_type == "latent_concat":
                     latent_model_input = torch.concat(
-                        [latents, img_latents_concat, mask_concat, partial_cond, partial_mask], dim=1)
+                        [
+                            latents,
+                            img_latents_concat,
+                            mask_concat,
+                            partial_cond,
+                            partial_mask,
+                        ],
+                        dim=1,
+                    )
                 else:
+                    """
+                    不是 i2v 模式(e.g. t2v)，直接使用原始 latents(纯噪声)
+                    """
                     latent_model_input = latents
 
                 latent_model_input = (
@@ -1063,8 +1084,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 t_expand = t.repeat(latent_model_input.shape[0])
                 guidance_expand = (
                     torch.tensor(
-                        [embedded_guidance_scale] *
-                        latent_model_input.shape[0],
+                        [embedded_guidance_scale] * latent_model_input.shape[0],
                         dtype=torch.float32,
                         device=device,
                     ).to(target_dtype)
@@ -1077,6 +1097,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
+                    # DiT
                     noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
                         latent_model_input,  # [2, 16, 33, 24, 42]
                         t_expand,  # [2]
@@ -1111,11 +1132,13 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 # compute the previous noisy sample x_t -> x_t-1
                 if i2v_mode and i2v_condition_type == "token_replace":
                     latents = self.scheduler.step(
-                        noise_pred[:, :, 1:, :, :], t, latents[:, :, 1:, :, :], **extra_step_kwargs, return_dict=False
+                        noise_pred[:, :, 1:, :, :],
+                        t,
+                        latents[:, :, 1:, :, :],
+                        **extra_step_kwargs,
+                        return_dict=False,
                     )[0]
-                    latents = torch.concat(
-                        [img_latents, latents], dim=2
-                    )
+                    latents = torch.concat([img_latents, latents], dim=2)
                 else:
                     latents = self.scheduler.step(
                         noise_pred, t, latents, **extra_step_kwargs, return_dict=False
@@ -1125,20 +1148,17 @@ Please use VaeImageProcessor.postprocess(...) instead"
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(
-                        self, i, t, callback_kwargs)
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
                     latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop(
-                        "prompt_embeds", prompt_embeds)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     negative_prompt_embeds = callback_outputs.pop(
                         "negative_prompt_embeds", negative_prompt_embeds
                     )
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
-                    (i + 1) > num_warmup_steps and (i +
-                                                    1) % self.scheduler.order == 0
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
                 ):
                     if progress_bar is not None:
                         progress_bar.update()
@@ -1196,7 +1216,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
 
         if i2v_mode and i2v_condition_type == "latent_concat":
             image = image[:, :, 4:, :, :]
-        
+
         # split rgb and depth, process depth output separately
         half_height = (height - 16) // 2
         rgb = image[..., :half_height, :]
